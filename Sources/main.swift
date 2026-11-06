@@ -545,21 +545,26 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func openUpdate() { if let u = updateAvailable, let url = URL(string: u.url) { NSWorkspace.shared.open(url) } }
     @objc private func checkNow() { checkForUpdates(manual: true) }
 
+    /// Spør ikke GitHubs API (har strenge grenser), men følger lenken «siste release» og leser versjonen fra adressen den ender på.
     private func checkForUpdates(manual: Bool = false) {
-        guard !updateRepo.isEmpty, let url = URL(string: "https://api.github.com/repos/\(updateRepo)/releases/latest") else { return }
-        URLSession.shared.dataTask(with: url) { data, _, _ in
-            guard let data, let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let tag = json["tag_name"] as? String, let page = json["html_url"] as? String else { return }
+        guard !updateRepo.isEmpty, let url = URL(string: "https://github.com/\(updateRepo)/releases/latest") else { return }
+        var request = URLRequest(url: url)
+        request.httpMethod = "HEAD"
+        request.timeoutInterval = 20
+        URLSession.shared.dataTask(with: request) { _, response, error in
+            let final = (response as? HTTPURLResponse)?.url
+            let tag = final?.lastPathComponent ?? ""
+            logger.info("Oppdateringssjekk: \(tag, privacy: .public) \(error?.localizedDescription ?? "", privacy: .public)")
+            guard let final, final.path.contains("/releases/tag/"), !tag.isEmpty else { return }
             let latest = tag.trimmingCharacters(in: CharacterSet(charactersIn: "vV"))
-            let assets = json["assets"] as? [[String: Any]] ?? []
-            let zip = assets.first { ($0["name"] as? String) == "Mute-Bridge.zip" }?["browser_download_url"] as? String
+            let zip = "https://github.com/\(self.updateRepo)/releases/download/\(tag)/Mute-Bridge.zip"
             DispatchQueue.main.async {
                 guard latest.compare(self.version, options: .numeric) == .orderedDescending else { return }
                 let isNew = self.updateAvailable?.version != latest
-                self.updateAvailable = (latest, page)
+                self.updateAvailable = (latest, final.absoluteString)
                 self.updateAsset = zip
                 self.updateMenu()
-                if self.autoUpdate, zip != nil { self.installUpdateIfIdle() }
+                if self.autoUpdate { self.installUpdateIfIdle() }
                 else if isNew { self.notify(title: "Mute Bridge \(latest) er klar", body: "Klikk på ikonet i menylinjen og velg «Oppdater».") }
             }
         }.resume()
