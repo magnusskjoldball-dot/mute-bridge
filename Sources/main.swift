@@ -563,7 +563,7 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var updateAsset: String?
     private var updating = false
     private var updateWanted = false
-    private let updateRow = UpdateRow()
+    private var updateRow = UpdateRow()
     private var checkState: UpdateRow.S?     // midlertidig: sjekker / nyeste / feilet
     private var menuDirty = false
     private var autoUpdate: Bool { UserDefaults.standard.object(forKey: "autoUpdate") as? Bool ?? true }
@@ -961,6 +961,7 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
         var items: [(String, Selector)] = []
         if !updateRepo.isEmpty {
+            updateRow = UpdateRow()     // ny rad for hver meny: samme visning kan ikke ligge i flere menyer
             updateRow.onClick = { [weak self] in self?.updateRowClicked() }
             refreshUpdateRow()
             let rowItem = NSMenuItem(); rowItem.view = updateRow
