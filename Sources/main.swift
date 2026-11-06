@@ -452,20 +452,20 @@ final class UpdateRow: NSView {
         }
         if spin { spinner.startAnimation(nil) } else { spinner.stopAnimation(nil) }
         guard animated else { setText(); pill.alphaValue = showPill ? 1 : 0; needsDisplay = true; return }
-        NSAnimationContext.runAnimationGroup({ ctx in
-            ctx.duration = 0.10
-            self.label.animator().alphaValue = 0
-        }, completionHandler: {
-            setText()
-            self.label.frame.origin.y = self.baseY - 9       // glir opp nedenfra
-            NSAnimationContext.runAnimationGroup { ctx in
-                ctx.duration = 0.34
-                ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.2, 0.9, 0.25, 1.0)
-                self.label.animator().alphaValue = 1
-                self.label.animator().frame.origin.y = self.baseY
-                self.pill.animator().alphaValue = showPill ? 1 : 0
-            }
-        })
+        // Alt settes til sluttverdi med en gang (synlig selv om animasjonen ikke rekker å kjøre i menyen); animasjonen er bare pynt.
+        setText()
+        label.alphaValue = 0
+        label.frame.origin.y = baseY - 9
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.34
+            ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.2, 0.9, 0.25, 1.0)
+            ctx.allowsImplicitAnimation = true
+            self.label.animator().alphaValue = 1
+            self.label.animator().frame.origin.y = self.baseY
+            self.pill.animator().alphaValue = showPill ? 1 : 0
+        }
+        label.alphaValue = 1
+        label.frame.origin.y = baseY
         if showPill {
             let pop = CASpringAnimation(keyPath: "transform.scale")
             pill.layer?.anchorPoint = CGPoint(x: 0.5, y: 0.5)
@@ -1127,34 +1127,8 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return inCall
     }
 
-    /// macOS kan sende «fn sluppet» mens tasten fortsatt holdes. Stol derfor ikke blindt på hendelsen: sjekk den virkelige tastestatusen først.
     func flagEvent(_ down: Bool, raw: UInt64) {
-        if down { setFn(true); return }
-        guard fnDown else { return }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
-            guard let self, self.fnDown else { return }
-            if CGEventSource.flagsState(.hidSystemState).contains(.maskSecondaryFn) {
-                dlog("ignorerer falsk «fn opp» (flagg \(String(raw, radix: 16))), tasten holdes fortsatt")
-                self.watchHold()
-            } else {
-                self.setFn(false)
-            }
-        }
-    }
-
-    /// Mens fn holdes: sjekk jevnlig at tasten faktisk er nede, slik at vi aldri blir stående dempet (eller åpne) feil vei.
-    private var holdTimer: Timer?
-    private func watchHold() {
-        holdTimer?.invalidate()
-        holdTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] t in
-            guard let self else { t.invalidate(); return }
-            guard self.fnDown else { t.invalidate(); self.holdTimer = nil; return }
-            if !CGEventSource.flagsState(.hidSystemState).contains(.maskSecondaryFn) {
-                dlog("fn er sluppet (oppdaget ved sjekk)")
-                t.invalidate(); self.holdTimer = nil
-                self.setFn(false)
-            }
-        }
+        setFn(down)
     }
 
     func resync() {
@@ -1171,7 +1145,6 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let now = Date()
         if pressed {
             if muting { routing?.mute(true); beginMute() } else { countUnmuted(now) }
-            watchHold()
             pressedAt = now
             if !latched { checkDiscordMic() }
             if latched {
