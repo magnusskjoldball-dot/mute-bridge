@@ -19,6 +19,12 @@ enum RoutingError: LocalizedError {
     }
 }
 
+/// Internt versjonsnummer (20, 21, …) vises som 1.1, 1.2, … Eldre numre vises som de er.
+func pretty(_ v: String) -> String {
+    if let n = Int(v), n >= 20 { return "1.\(n - 19)" }
+    return v
+}
+
 func dlog(_ text: String) {
     let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/MuteBridge.log")
     let f = DateFormatter(); f.dateFormat = "MM-dd HH:mm:ss.SSS"
@@ -394,6 +400,95 @@ final class BlueSwitch: NSControl {
     }
 }
 
+final class UpdateRow: NSView {
+    enum S: Equatable { case idle, checking, upToDate, failed, available(String), waiting(String), updating }
+    var onClick: (() -> Void)?
+    private(set) var state = S.idle
+    private let label = NSTextField(labelWithString: "")
+    private let pill = NSView()
+    private let spinner = NSProgressIndicator()
+    private var hover = false
+    private let baseY: CGFloat = 7
+    override init(frame: NSRect) {
+        super.init(frame: NSRect(x: 0, y: 0, width: 340, height: 32))
+        wantsLayer = true
+        pill.wantsLayer = true
+        pill.layer?.cornerRadius = 7
+        pill.layer?.backgroundColor = NSColor(srgbRed: 0.22, green: 0.51, blue: 0.97, alpha: 1).cgColor
+        pill.frame = NSRect(x: 8, y: 2, width: 324, height: 28)
+        pill.alphaValue = 0
+        spinner.style = .spinning; spinner.controlSize = .small; spinner.isDisplayedWhenStopped = false
+        spinner.frame = NSRect(x: 16, y: 8, width: 16, height: 16)
+        label.font = .systemFont(ofSize: 13)
+        label.frame = NSRect(x: 16, y: baseY, width: 308, height: 18)
+        addSubview(pill); addSubview(spinner); addSubview(label)
+        addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self))
+        apply(.idle, animated: false)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    private func text(_ s: S) -> (String, NSColor, Bool, Bool) {   // tekst, farge, pille, spinner
+        switch s {
+        case .idle: return ("Sjekk etter oppdateringer", .labelColor, false, false)
+        case .checking: return ("Sjekker …", .secondaryLabelColor, false, true)
+        case .upToDate: return ("✓  Du har nyeste versjon", .secondaryLabelColor, false, false)
+        case .failed: return ("Kunne ikke sjekke – prøv igjen", .systemOrange, false, false)
+        case .available(let v): return ("⬆︎  Oppdater til \(pretty(v)) nå", .white, true, false)
+        case .waiting(let v): return ("\(pretty(v)) klar – gå ut av samtalen for å oppdatere", .systemOrange, false, false)
+        case .updating: return ("Oppdaterer …", .secondaryLabelColor, false, true)
+        }
+    }
+
+    func set(_ s: S) { guard s != state else { return }; apply(s, animated: window != nil) }
+
+    private func apply(_ s: S, animated: Bool) {
+        state = s
+        let (t, color, showPill, spin) = text(s)
+        label.font = .systemFont(ofSize: 13, weight: showPill ? .semibold : .regular)
+        let x: CGFloat = spin ? 38 : 16
+        let setText = {
+            self.label.stringValue = t; self.label.textColor = color
+            self.label.frame = NSRect(x: showPill ? 24 : x, y: self.baseY, width: 300, height: 18)
+        }
+        if spin { spinner.startAnimation(nil) } else { spinner.stopAnimation(nil) }
+        guard animated else { setText(); pill.alphaValue = showPill ? 1 : 0; needsDisplay = true; return }
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.10
+            self.label.animator().alphaValue = 0
+        }, completionHandler: {
+            setText()
+            self.label.frame.origin.y = self.baseY - 9       // glir opp nedenfra
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.34
+                ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.2, 0.9, 0.25, 1.0)
+                self.label.animator().alphaValue = 1
+                self.label.animator().frame.origin.y = self.baseY
+                self.pill.animator().alphaValue = showPill ? 1 : 0
+            }
+        })
+        if showPill {
+            let pop = CASpringAnimation(keyPath: "transform.scale")
+            pill.layer?.anchorPoint = CGPoint(x: 0.5, y: 0.5)
+            pop.fromValue = 0.94; pop.toValue = 1; pop.mass = 1; pop.stiffness = 260; pop.damping = 14
+            pop.duration = pop.settlingDuration
+            pill.layer?.add(pop, forKey: "pop")
+        }
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard hover, !text(state).2, state != .checking, state != .updating else { return }
+        NSColor.labelColor.withAlphaComponent(0.12).setFill()
+        NSBezierPath(roundedRect: bounds.insetBy(dx: 6, dy: 1), xRadius: 6, yRadius: 6).fill()
+    }
+    override func mouseEntered(with event: NSEvent) { hover = true; needsDisplay = true }
+    override func mouseExited(with event: NSEvent) { hover = false; needsDisplay = true }
+    override func mouseUp(with event: NSEvent) {
+        guard state != .checking, state != .updating else { return }
+        onClick?()
+    }
+}
+
 final class SwitchView: NSView {
     let toggle = BlueSwitch()
     init(title: String, subtitle: String, on: Bool, target: AnyObject, action: Selector) {
@@ -418,8 +513,20 @@ final class SwitchView: NSView {
 final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var menuOpen = false
     private var frame = 0
-    func menuWillOpen(_ menu: NSMenu) { menuOpen = true }
-    func menuDidClose(_ menu: NSMenu) { menuOpen = false }
+    func menuWillOpen(_ menu: NSMenu) { menuOpen = true; refreshUpdateRow() }
+    func menuDidClose(_ menu: NSMenu) { menuOpen = false; if menuDirty { menuDirty = false; updateMenu() } }
+
+    private func refreshUpdateRow() {
+        let inCall = fnDown || latched || (Bridge.smartAvailable && othersReadBlackHole())
+        if updating { updateRow.set(.updating) }
+        else if let u = updateAvailable { updateRow.set(updateWanted && inCall ? .waiting(u.version) : .available(u.version)) }
+        else { updateRow.set(checkState ?? .idle) }
+    }
+
+    @objc private func updateRowClicked() {
+        if updateAvailable != nil { updateNow() } else { checkForUpdates(manual: true) }
+        refreshUpdateRow()
+    }
     private var status: NSStatusItem!
     private var routing: Routing?
     private var eventTap: CFMachPort?
@@ -445,6 +552,9 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var updateAsset: String?
     private var updating = false
     private var updateWanted = false
+    private let updateRow = UpdateRow()
+    private var checkState: UpdateRow.S?     // midlertidig: sjekker / nyeste / feilet
+    private var menuDirty = false
     private var autoUpdate: Bool { UserDefaults.standard.object(forKey: "autoUpdate") as? Bool ?? true }
     private let updateRepo = "magnusskjoldball-dot/mute-bridge"
     private let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0"
@@ -485,7 +595,7 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let defaults = UserDefaults.standard
         if defaults.string(forKey: "mode") == "off" { defaults.set("auto", forKey: "mode"); defaults.set(false, forKey: "muting") }
         if let last = defaults.string(forKey: "lastVersion"), last != version {
-            notify(title: "Mute Bridge er oppdatert", body: "Du har nå versjon \(version).")
+            notify(title: "Mute Bridge er oppdatert", body: "Du har nå versjon \(pretty(version)).")
         }
         defaults.set(version, forKey: "lastVersion")
         watchDevices()
@@ -653,6 +763,20 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Spør ikke GitHubs API (har strenge grenser), men følger lenken «siste release» og leser versjonen fra adressen den ender på.
     private func checkForUpdates(manual: Bool = false) {
         guard !updateRepo.isEmpty, let url = URL(string: "https://github.com/\(updateRepo)/releases/latest") else { return }
+        if manual { checkState = .checking; refreshUpdateRow() }
+        let began = Date()
+        let finish: (UpdateRow.S?) -> Void = { [weak self] result in
+            // la «Sjekker …» stå litt, så animasjonen rekker å bli sett
+            let wait = max(0, 0.7 - Date().timeIntervalSince(began))
+            DispatchQueue.main.asyncAfter(deadline: .now() + wait) {
+                guard let self, manual else { return }
+                self.checkState = result
+                self.refreshUpdateRow()
+                if result == .upToDate || result == .failed {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 3.5) { self.checkState = nil; self.refreshUpdateRow() }
+                }
+            }
+        }
         var request = URLRequest(url: url)
         request.httpMethod = "HEAD"
         request.timeoutInterval = 20
@@ -660,17 +784,18 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let final = (response as? HTTPURLResponse)?.url
             let tag = final?.lastPathComponent ?? ""
             logger.info("Oppdateringssjekk: \(tag, privacy: .public) \(error?.localizedDescription ?? "", privacy: .public)")
-            guard let final, final.path.contains("/releases/tag/"), !tag.isEmpty else { return }
+            guard let final, final.path.contains("/releases/tag/"), !tag.isEmpty else { finish(.failed); return }
             let latest = tag.trimmingCharacters(in: CharacterSet(charactersIn: "vV"))
             let zip = "https://github.com/\(self.updateRepo)/releases/download/\(tag)/Mute-Bridge.zip"
             DispatchQueue.main.async {
-                guard latest.compare(self.version, options: .numeric) == .orderedDescending else { return }
+                guard latest.compare(self.version, options: .numeric) == .orderedDescending else { finish(.upToDate); return }
                 let isNew = self.updateAvailable?.version != latest
                 self.updateAvailable = (latest, final.absoluteString)
                 self.updateAsset = zip
+                finish(nil)
                 self.updateMenu()
                 if self.autoUpdate { self.installUpdateIfIdle() }
-                else if isNew { self.notify(title: "Mute Bridge \(latest) er klar", body: "Klikk på ikonet i menylinjen og velg «Oppdater».") }
+                else if isNew { self.notify(title: "Mute Bridge \(pretty(latest)) er klar", body: "Klikk på ikonet i menylinjen og velg «Oppdater».") }
             }
         }.resume()
     }
@@ -726,7 +851,7 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if force {
                 // Aldri bytt ut appen midt i en samtale: si fra, og oppdater så snart samtalen er over
                 updateWanted = true
-                notify(title: "Mute Bridge \(u.version) er klar", body: "Gå ut av Discord-samtalen, så oppdaterer den seg selv med en gang.")
+                notify(title: "Mute Bridge \(pretty(u.version)) er klar", body: "Gå ut av Discord-samtalen, så oppdaterer den seg selv med en gang.")
                 updateMenu()
             }
             return
@@ -735,11 +860,11 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let dest = Bundle.main.bundleURL.path
         guard FileManager.default.isWritableFile(atPath: Bundle.main.bundleURL.deletingLastPathComponent().path) else {
             updateAsset = nil
-            notify(title: "Mute Bridge \(u.version) er klar", body: "Kunne ikke oppdatere automatisk. Kjør installasjonslinjen på nytt (se GitHub).")
+            notify(title: "Mute Bridge \(pretty(u.version)) er klar", body: "Kunne ikke oppdatere automatisk. Kjør installasjonslinjen på nytt (se GitHub).")
             return
         }
         updating = true
-        message = "Oppdaterer til \(u.version) …"
+        message = "Oppdaterer til \(pretty(u.version)) …"
         updateMenu()
         URLSession.shared.downloadTask(with: url) { [weak self] tmp, _, err in
             guard let self else { return }
@@ -790,7 +915,9 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
         status.button?.title = ""
         updateIcon()
         status.button?.toolTip = message
+        if menuOpen { menuDirty = true; refreshUpdateRow(); return }   // ikke bygg om menyen mens den er åpen
         let menu = NSMenu()
+        menu.delegate = self
         let switchItem = NSMenuItem()
         switchItem.view = SwitchView(title: "Demp meg når jeg dikterer", subtitle: muting ? (routing == nil ? "På · venter på Discord-samtale" : "På · Discord hører ikke dikteringen") : "Av · Discord hører deg også når du dikterer", on: muting, target: self, action: #selector(toggleEnabled(_:)))
         menu.addItem(switchItem)
@@ -822,14 +949,14 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(micItem)
         menu.addItem(.separator())
         var items: [(String, Selector)] = []
-        if updating { items.append(("⬆︎  Oppdaterer …", #selector(checkNow))) }
-        else if let u = updateAvailable {
-            let inCall = fnDown || latched || (Bridge.smartAvailable && othersReadBlackHole())
-            items.append((updateWanted && inCall ? "⬆︎  \(u.version) klar – gå ut av samtalen for å oppdatere" : "⬆︎  Oppdater til \(u.version) nå", #selector(updateNow)))
+        if !updateRepo.isEmpty {
+            updateRow.onClick = { [weak self] in self?.updateRowClicked() }
+            refreshUpdateRow()
+            let rowItem = NSMenuItem(); rowItem.view = updateRow
+            menu.addItem(rowItem)
         }
         if latched { items.append(("🔓  Lås opp mikrofon", #selector(unlatchFromMenu))) }
         items.append(("↻  Start på nytt", #selector(start)))
-        if !updateRepo.isEmpty { items.append(("Sjekk etter oppdateringer", #selector(checkNow))) }
         items.append(("Avslutt", #selector(quit)))
         for (title, action) in items {
             let item = menu.addItem(withTitle: title, action: action, keyEquivalent: "")
@@ -837,7 +964,7 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         let au = menu.addItem(withTitle: "Oppdater automatisk", action: #selector(toggleAutoUpdate), keyEquivalent: "")
         au.target = self; au.state = autoUpdate ? .on : .off
-        let ver = menu.addItem(withTitle: "Mute Bridge v\(version)", action: nil, keyEquivalent: "")
+        let ver = menu.addItem(withTitle: "Mute Bridge v\(pretty(version))", action: nil, keyEquivalent: "")
         ver.isEnabled = false
         status.menu = menu
     }
