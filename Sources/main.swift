@@ -332,19 +332,108 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     private let tapMax = 0.30, doubleTapWindow = 0.40, releaseDelay = 0.11, latchLimit = 180.0
     private var message = "Starter …"
+    private var mode: String { UserDefaults.standard.string(forKey: "mode") ?? "auto" }   // auto | always | off
+    private var idleSince: Date?
+    private var evalTimer: Timer?
+    private var watchedBlackHole: AudioDeviceID?
+    private static let smartAvailable: Bool = { if #available(macOS 14.2, *) { return true } else { return false } }()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         status = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         updateMenu()
         start()
-        let timer = Timer(timeInterval: 1.0 / 12, repeats: true) { [weak self] _ in self?.tick() }
-        timer.tolerance = 0.04
-        RunLoop.main.add(timer, forMode: .common)
-        meterTimer = timer
+        let ev = Timer(timeInterval: 3, repeats: true) { [weak self] _ in self?.evaluate() }
+        ev.tolerance = 1
+        RunLoop.main.add(ev, forMode: .common)
+        evalTimer = ev
         watchDevices()
         checkForUpdates()
         let upd = Timer(timeInterval: 6 * 3600, repeats: true) { [weak self] _ in self?.checkForUpdates() }
         RunLoop.main.add(upd, forMode: .common)
+    }
+
+    private func startMeter() {
+        guard meterTimer == nil else { return }
+        let timer = Timer(timeInterval: 1.0 / 12, repeats: true) { [weak self] _ in self?.tick() }
+        timer.tolerance = 0.04
+        RunLoop.main.add(timer, forMode: .common)
+        meterTimer = timer
+    }
+
+    private func stopMeter() {
+        meterTimer?.invalidate()
+        meterTimer = nil
+        level = 0
+    }
+
+    private func beginRoute() {
+        guard routing == nil, eventTap != nil else { return }
+        do {
+            let route = Routing()
+            try route.start()
+            routing = route
+            fnDown = CGEventSource.flagsState(.hidSystemState).contains(.maskSecondaryFn)
+            route.mute(fnDown || latched)
+            message = "Sender mikrofonen til BlackHole 2ch"
+            idleSince = nil
+            startMeter()
+        } catch {
+            routing = nil
+            message = error.localizedDescription
+        }
+        updateMenu()
+    }
+
+    private func endRoute() {
+        routing?.mute(true)
+        routing = nil
+        stopMeter()
+        endMute()
+        message = mode == "off" ? "Av" : "Venter på Discord-samtale"
+        updateMenu()
+    }
+
+    private func applyMode() {
+        switch mode {
+        case "off":
+            if routing != nil { endRoute() } else { message = "Av" }
+        case "always":
+            beginRoute()
+        default:
+            if !Bridge.smartAvailable || othersReadBlackHole() { beginRoute() } else if routing == nil { message = "Venter på Discord-samtale" }
+        }
+    }
+
+    private func othersReadBlackHole() -> Bool {
+        if #available(macOS 14.2, *) { return Bridge.someoneReadsBlackHole() }
+        return true
+    }
+
+    /// Kjører hvert 3. sekund og når noen begynner å lese BlackHole: slår ruten på i en Discord-samtale og av når den er over.
+    private func evaluate() {
+        guard eventTap != nil, mode != "off" else { return }
+        if #available(macOS 14.2, *), Bridge.discordUsesWrongMic() {
+            showTip(title: "Du er i en Discord-samtale",
+                    body: "Velg «BlackHole 2ch» som mikrofon i Discord (Innstillinger, Voice & Video), så kan Mute Bridge dempe deg mens du dikterer.")
+        }
+        guard mode == "auto", Bridge.smartAvailable else { return }
+        if othersReadBlackHole() {
+            idleSince = nil
+            if routing == nil { beginRoute() }
+        } else if routing != nil {
+            if let t = idleSince {
+                if Date().timeIntervalSince(t) > 10 { idleSince = nil; endRoute() }
+            } else {
+                idleSince = Date()
+            }
+        }
+    }
+
+    private func watchBlackHole() {
+        guard let bh = blackHole(), bh != watchedBlackHole else { return }
+        watchedBlackHole = bh
+        var address = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyDeviceIsRunningSomewhere, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        AudioObjectAddPropertyListenerBlock(bh, &address, DispatchQueue.main) { [weak self] _, _ in self?.evaluate() }
     }
 
     private func tick() {
@@ -385,6 +474,11 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
         muteBegan = nil
         let d = Date().timeIntervalSince(began)
         if d >= 0.8 { var t = today; t.count += 1; t.seconds += d; today = t }
+    }
+
+    @objc private func pickMode(_ sender: NSMenuItem) {
+        UserDefaults.standard.set(sender.representedObject as? String ?? "auto", forKey: "mode")
+        start()
     }
 
     @objc private func pickMic(_ sender: NSMenuItem) {
@@ -457,6 +551,16 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let menu = NSMenu()
         menu.addItem(withTitle: message, action: nil, keyEquivalent: "")
         menu.addItem(.separator())
+        let modeMenu = NSMenu()
+        let modes = [("auto", "Automatisk – bare i Discord-samtale"), ("always", "Alltid på"), ("off", "Av")]
+        for (id, title) in modes {
+            let item = NSMenuItem(title: title, action: #selector(pickMode(_:)), keyEquivalent: "")
+            item.representedObject = id; item.target = self; item.state = mode == id ? .on : .off
+            modeMenu.addItem(item)
+        }
+        let modeItem = NSMenuItem(title: "Drift: \(modes.first { $0.0 == mode }?.1.components(separatedBy: " –").first ?? "")", action: nil, keyEquivalent: "")
+        modeItem.submenu = modeMenu
+        menu.addItem(modeItem)
         let micMenu = NSMenu()
         let saved = UserDefaults.standard.string(forKey: "micUID") ?? "auto"
         let current = chosenInput()
@@ -496,6 +600,8 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
         latched = false
         lastQuickTap = nil
         endMute()
+        idleSince = nil
+        stopMeter()
         routing?.mute(true)
         if let eventTap { CFMachPortInvalidate(eventTap) }
         if let source { CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes) }
@@ -549,40 +655,67 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
         eventTap = tap
         source = runLoopSource
         CFRunLoopAddSource(CFRunLoopGetMain(), runLoopSource, .commonModes)
-        do {
-            let route = Routing()
-            try route.start()
-            routing = route
-            fnDown = CGEventSource.flagsState(.hidSystemState).contains(.maskSecondaryFn)
-            route.mute(fnDown)
-            message = "Sender mikrofonen til BlackHole 2ch"
-        } catch {
-            stop()
-            message = error.localizedDescription
-        }
+        watchBlackHole()
+        fnDown = CGEventSource.flagsState(.hidSystemState).contains(.maskSecondaryFn)
+        applyMode()
         updateMenu()
     }
 
     private var lastTip = Date.distantPast
 
-    /// Sjekker (bare når du begynner å diktere) om Discord er i en samtale uten å bruke BlackHole 2ch.
+    private func showTip(title: String, body: String) {
+        guard Date().timeIntervalSince(lastTip) > 1800 else { return }
+        lastTip = Date()
+        let c = UNUserNotificationCenter.current()
+        c.requestAuthorization(options: [.alert]) { ok, _ in
+            guard ok else { return }
+            let n = UNMutableNotificationContent()
+            n.title = title
+            n.body = body
+            c.add(UNNotificationRequest(identifier: "discord-mic", content: n, trigger: nil))
+        }
+    }
+
+    /// Når du begynner å diktere: er Discord i en samtale uten BlackHole 2ch?
     private func checkDiscordMic() {
         guard Date().timeIntervalSince(lastTip) > 1800 else { return }
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard #available(macOS 14.2, *), Bridge.discordUsesWrongMic() else { return }
             DispatchQueue.main.async {
-                guard let self, Date().timeIntervalSince(self.lastTip) > 1800 else { return }
-                self.lastTip = Date()
-                let c = UNUserNotificationCenter.current()
-                c.requestAuthorization(options: [.alert]) { ok, _ in
-                    guard ok else { return }
-                    let n = UNMutableNotificationContent()
-                    n.title = "Discord hører deg mens du dikterer"
-                    n.body = "Velg «BlackHole 2ch» som mikrofon i Discord: Innstillinger, Voice & Video, Input Device."
-                    c.add(UNNotificationRequest(identifier: "discord-mic", content: n, trigger: nil))
-                }
+                self?.showTip(title: "Discord hører deg mens du dikterer",
+                              body: "Velg «BlackHole 2ch» som mikrofon i Discord: Innstillinger, Voice & Video, Input Device.")
             }
         }
+    }
+
+    @available(macOS 14.2, *)
+    static func someoneReadsBlackHole() -> Bool {
+        func prop<T>(_ id: AudioObjectID, _ sel: AudioObjectPropertySelector, _ v: inout T, scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal) -> Bool {
+            var a = AudioObjectPropertyAddress(mSelector: sel, mScope: scope, mElement: kAudioObjectPropertyElementMain)
+            var size = UInt32(MemoryLayout<T>.size)
+            return AudioObjectGetPropertyData(id, &a, 0, nil, &size, &v) == noErr
+        }
+        func list(_ id: AudioObjectID, _ sel: AudioObjectPropertySelector, scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal) -> [AudioObjectID] {
+            var a = AudioObjectPropertyAddress(mSelector: sel, mScope: scope, mElement: kAudioObjectPropertyElementMain)
+            var size: UInt32 = 0
+            guard AudioObjectGetPropertyDataSize(id, &a, 0, nil, &size) == noErr, size > 0 else { return [] }
+            var out = [AudioObjectID](repeating: 0, count: Int(size) / MemoryLayout<AudioObjectID>.size)
+            guard AudioObjectGetPropertyData(id, &a, 0, nil, &size, &out) == noErr else { return [] }
+            return out
+        }
+        func uid(_ d: AudioObjectID) -> String {
+            var u: Unmanaged<CFString>?
+            return prop(d, kAudioDevicePropertyDeviceUID, &u) ? (u?.takeRetainedValue() as String? ?? "") : ""
+        }
+        let me = Bundle.main.bundleIdentifier ?? ""
+        for p in list(AudioObjectID(kAudioObjectSystemObject), kAudioHardwarePropertyProcessObjectList) {
+            var bid: Unmanaged<CFString>?
+            if prop(p, kAudioProcessPropertyBundleID, &bid), (bid?.takeRetainedValue() as String?) == me { continue }
+            var running: UInt32 = 0
+            guard prop(p, kAudioProcessPropertyIsRunningInput, &running), running != 0 else { continue }
+            if list(p, kAudioProcessPropertyDevices, scope: kAudioObjectPropertyScopeInput).map(uid).contains("BlackHole2ch_UID") { return true }
+        }
+        return false
     }
 
     @available(macOS 14.2, *)
