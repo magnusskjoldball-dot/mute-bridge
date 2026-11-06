@@ -248,7 +248,7 @@ func baseMeterImage(state: String, level: Int, variant: Int, dim: Bool) -> NSIma
     let (c0, c1) = iconColors(state)
     let a = c0.usingColorSpace(.sRGB)!, b = c1.usingColorSpace(.sRGB)!
     let muted = state == "STILLE" || state == "LÅST"
-    let l = CGFloat(level) / 8
+    let l = CGFloat(level) / 4
     let image = NSImage(size: NSSize(width: 30, height: 18), flipped: false) { _ in
         let w: CGFloat = 3.6, gap: CGFloat = 2.4
         for i in 0..<5 {
@@ -606,8 +606,8 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func startMeter() {
         guard meterTimer == nil else { return }
-        let timer = Timer(timeInterval: 1.0 / 12, repeats: true) { [weak self] _ in self?.tick() }
-        timer.tolerance = 0.04
+        let timer = Timer(timeInterval: 1.0 / 6, repeats: true) { [weak self] _ in self?.tick() }
+        timer.tolerance = 0.08
         RunLoop.main.add(timer, forMode: .common)
         meterTimer = timer
     }
@@ -694,7 +694,7 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let raw = Double(routing?.level() ?? 0)
         let db = raw > 0.00001 ? 20 * log10(raw) : -100
         let target = max(0, min(1, (db + 50) / 40))
-        level = target > level ? target : level * 0.72 + target * 0.28
+        level = target > level ? target : level * 0.5 + target * 0.5
         updateIcon()
     }
 
@@ -898,8 +898,8 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func updateIcon() {
         let state = !muting ? (routing == nil ? "AV" : "PASS") : routing == nil ? "VENT" : latched ? "LÅST" : fnDown ? "STILLE" : "LIVE"
-        let lv = (state == "AV" || state == "VENT") ? 0 : Int((level * 8).rounded())
-        let variant = lv == 0 ? 0 : 1 + frameCount / 2 % 2
+        let lv = (state == "AV" || state == "VENT") ? 0 : Int((level * 4).rounded())
+        let variant = lv == 0 ? 0 : 1
         let dim = state == "LÅST" && Int(Date().timeIntervalSinceReferenceDate * 2) % 2 == 0
         let badge = updateAvailable != nil
         let key = "\(state)-\(lv)-\(variant)-\(dim)-\(badge)"
@@ -1015,7 +1015,7 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     bridge.resync()
                 }
             } else if type == .flagsChanged {
-                bridge.setFn(event.flags.contains(.maskSecondaryFn))
+                bridge.flagEvent(event.flags.contains(.maskSecondaryFn), raw: event.flags.rawValue)
             } else if type == .keyDown, event.getIntegerValueField(.keyboardEventKeycode) == 53 {
                 DispatchQueue.main.async { bridge.unlatch() }
             }
@@ -1127,6 +1127,36 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return inCall
     }
 
+    /// macOS kan sende «fn sluppet» mens tasten fortsatt holdes. Stol derfor ikke blindt på hendelsen: sjekk den virkelige tastestatusen først.
+    func flagEvent(_ down: Bool, raw: UInt64) {
+        if down { setFn(true); return }
+        guard fnDown else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+            guard let self, self.fnDown else { return }
+            if CGEventSource.flagsState(.hidSystemState).contains(.maskSecondaryFn) {
+                dlog("ignorerer falsk «fn opp» (flagg \(String(raw, radix: 16))), tasten holdes fortsatt")
+                self.watchHold()
+            } else {
+                self.setFn(false)
+            }
+        }
+    }
+
+    /// Mens fn holdes: sjekk jevnlig at tasten faktisk er nede, slik at vi aldri blir stående dempet (eller åpne) feil vei.
+    private var holdTimer: Timer?
+    private func watchHold() {
+        holdTimer?.invalidate()
+        holdTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] t in
+            guard let self else { t.invalidate(); return }
+            guard self.fnDown else { t.invalidate(); self.holdTimer = nil; return }
+            if !CGEventSource.flagsState(.hidSystemState).contains(.maskSecondaryFn) {
+                dlog("fn er sluppet (oppdaget ved sjekk)")
+                t.invalidate(); self.holdTimer = nil
+                self.setFn(false)
+            }
+        }
+    }
+
     func resync() {
         let down = CGEventSource.flagsState(.hidSystemState).contains(.maskSecondaryFn)
         dlog("resync fn=\(down)")
@@ -1141,6 +1171,7 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let now = Date()
         if pressed {
             if muting { routing?.mute(true); beginMute() } else { countUnmuted(now) }
+            watchHold()
             pressedAt = now
             if !latched { checkDiscordMic() }
             if latched {
