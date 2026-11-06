@@ -184,7 +184,7 @@ func iconColors(_ state: String) -> (NSColor, NSColor) {
     switch state {
     case "STILLE": return (NSColor(srgbRed: 0.93, green: 0.27, blue: 0.36, alpha: 1), NSColor(srgbRed: 1, green: 0.58, blue: 0.68, alpha: 1))
     case "LÅST": return (NSColor(srgbRed: 1, green: 0.58, blue: 0.18, alpha: 1), NSColor(srgbRed: 1, green: 0.85, blue: 0.38, alpha: 1))
-    case "AV": return (NSColor(white: 0.6, alpha: 1), NSColor(white: 0.75, alpha: 1))
+    case "PASS": return (NSColor(white: 0.55, alpha: 1), NSColor(white: 0.72, alpha: 1))
     default: return (NSColor(srgbRed: 0.62, green: 0.42, blue: 0.92, alpha: 1), NSColor(srgbRed: 0.35, green: 0.74, blue: 0.96, alpha: 1))
     }
 }
@@ -192,14 +192,22 @@ func iconColors(_ state: String) -> (NSColor, NSColor) {
 /// Fem små kapsler. Tegnes bare én gang per kombinasjon og caches av kalleren.
 func meterImage(state: String, level: Int, variant: Int, dim: Bool) -> NSImage {
     if state == "AV" {
-        // Hvile: bare en liten, diskret prikk som følger menylinjens farge (lys/mørk)
-        let dot = NSImage(size: NSSize(width: 14, height: 18), flipped: false) { _ in
-            NSColor.black.withAlphaComponent(0.55).setFill()
-            NSBezierPath(ovalIn: NSRect(x: 4, y: 6, width: 6, height: 6)).fill()
+        // Dempingen er av: tom ring som følger menylinjens farge
+        let ring = NSImage(size: NSSize(width: 14, height: 18), flipped: false) { _ in
+            NSColor.black.withAlphaComponent(0.6).setStroke()
+            let p = NSBezierPath(ovalIn: NSRect(x: 3.5, y: 5.5, width: 7, height: 7)); p.lineWidth = 1.3; p.stroke()
             return true
         }
-        dot.isTemplate = true
-        return dot
+        ring.isTemplate = true
+        return ring
+    }
+    if state == "VENT" {
+        // Dempingen er på og venter: liten fargeprikk
+        return NSImage(size: NSSize(width: 14, height: 18), flipped: false) { _ in
+            NSColor(srgbRed: 0.5, green: 0.52, blue: 0.95, alpha: 1).setFill()
+            NSBezierPath(ovalIn: NSRect(x: 3.5, y: 5.5, width: 7, height: 7)).fill()
+            return true
+        }
     }
     let shapes: [[CGFloat]] = [[0.55, 0.85, 1.0, 0.7, 0.45], [0.7, 1.0, 0.6, 0.9, 0.5], [0.45, 0.7, 0.95, 1.0, 0.65]]
     let (c0, c1) = iconColors(state)
@@ -210,7 +218,7 @@ func meterImage(state: String, level: Int, variant: Int, dim: Bool) -> NSImage {
         let w: CGFloat = 3.6, gap: CGFloat = 2.4
         for i in 0..<5 {
             let k = CGFloat(i) / 4
-            let h = state == "AV" ? 3 : 3 + (muted ? 0.3 : 1) * l * shapes[variant % 3][i] * 12
+            let h = 3 + (muted ? 0.3 : 1) * l * shapes[variant % 3][i] * 12
             let color = NSColor(srgbRed: a.redComponent + (b.redComponent - a.redComponent) * k,
                                 green: a.greenComponent + (b.greenComponent - a.greenComponent) * k,
                                 blue: a.blueComponent + (b.blueComponent - a.blueComponent) * k, alpha: dim ? 0.5 : 1)
@@ -297,22 +305,41 @@ final class Spectrum {
     func reset() { bands = [CGFloat](repeating: 0, count: count) }
 }
 
+final class BlueSwitch: NSControl {
+    var isOn = false { didSet { needsDisplay = true } }
+    override var isFlipped: Bool { false }
+    override func draw(_ dirtyRect: NSRect) {
+        let r = bounds.insetBy(dx: 1, dy: 1)
+        let track = NSBezierPath(roundedRect: r, xRadius: r.height / 2, yRadius: r.height / 2)
+        (isOn ? NSColor(srgbRed: 0.22, green: 0.51, blue: 0.97, alpha: 1) : NSColor(white: 0.5, alpha: 0.45)).setFill()
+        track.fill()
+        let d = r.height - 4
+        let x = isOn ? r.maxX - d - 2 : r.minX + 2
+        NSColor.white.setFill()
+        NSBezierPath(ovalIn: NSRect(x: x, y: r.minY + 2, width: d, height: d)).fill()
+    }
+    override func mouseDown(with event: NSEvent) {
+        isOn.toggle()
+        if let a = action { NSApp.sendAction(a, to: target, from: self) }
+    }
+}
+
 final class SwitchView: NSView {
-    let toggle = NSSwitch()
+    let toggle = BlueSwitch()
     init(title: String, subtitle: String, on: Bool, target: AnyObject, action: Selector) {
-        super.init(frame: NSRect(x: 0, y: 0, width: 290, height: 48))
+        super.init(frame: NSRect(x: 0, y: 0, width: 340, height: 52))
         let t = NSTextField(labelWithString: title)
         t.font = .systemFont(ofSize: 13, weight: .semibold)
-        t.frame = NSRect(x: 16, y: 26, width: 200, height: 17)
+        t.frame = NSRect(x: 16, y: 29, width: 255, height: 17)
         let sub = NSTextField(labelWithString: subtitle)
         sub.font = .systemFont(ofSize: 11)
         sub.textColor = .secondaryLabelColor
         sub.lineBreakMode = .byTruncatingTail
-        sub.frame = NSRect(x: 16, y: 8, width: 210, height: 15)
-        toggle.state = on ? .on : .off
+        sub.frame = NSRect(x: 16, y: 9, width: 255, height: 15)
+        toggle.isOn = on
         toggle.target = target
         toggle.action = action
-        toggle.frame = NSRect(x: 236, y: 12, width: 40, height: 24)
+        toggle.frame = NSRect(x: 280, y: 14, width: 46, height: 26)
         addSubview(t); addSubview(sub); addSubview(toggle)
     }
     required init?(coder: NSCoder) { fatalError() }
@@ -366,7 +393,11 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     private let tapMax = 0.30, doubleTapWindow = 0.40, releaseDelay = 0.11, latchLimit = 180.0
     private var message = "Starter …"
-    private var mode: String { UserDefaults.standard.string(forKey: "mode") ?? "auto" }   // auto | always | off
+    private var mode: String { UserDefaults.standard.string(forKey: "mode") == "always" ? "always" : "auto" }   // auto | always
+    private var muting: Bool { UserDefaults.standard.object(forKey: "muting") as? Bool ?? true }   // demp mikrofonen mens du dikterer
+    private var unmutedDictations = 0
+    private var lastCounted = Date.distantPast
+    private var nagShown = false
     private var idleSince: Date?
     private var evalTimer: Timer?
     private var watchedBlackHole: AudioDeviceID?
@@ -381,6 +412,7 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
         RunLoop.main.add(ev, forMode: .common)
         evalTimer = ev
         let defaults = UserDefaults.standard
+        if defaults.string(forKey: "mode") == "off" { defaults.set("auto", forKey: "mode"); defaults.set(false, forKey: "muting") }
         if let last = defaults.string(forKey: "lastVersion"), last != version {
             notify(title: "Mute Bridge er oppdatert", body: "Du har nå versjon \(version).")
         }
@@ -412,7 +444,7 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
             try route.start()
             routing = route
             fnDown = CGEventSource.flagsState(.hidSystemState).contains(.maskSecondaryFn)
-            route.mute(fnDown || latched)
+            route.mute(muting && (fnDown || latched))
             message = "Sender mikrofonen til BlackHole 2ch"
             idleSince = nil
             startMeter()
@@ -428,14 +460,13 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
         routing = nil
         stopMeter()
         endMute()
-        message = mode == "off" ? "Av" : "Venter på Discord-samtale"
+        message = "Venter på Discord-samtale"
+        unmutedDictations = 0; nagShown = false
         updateMenu()
     }
 
     private func applyMode() {
         switch mode {
-        case "off":
-            if routing != nil { endRoute() } else { message = "Av" }
         case "always":
             beginRoute()
         default:
@@ -450,7 +481,7 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// Kjører hvert 3. sekund og når noen begynner å lese BlackHole: slår ruten på i en Discord-samtale og av når den er over.
     private func evaluate() {
-        guard eventTap != nil, mode != "off" else { return }
+        guard eventTap != nil else { return }
         if #available(macOS 14.2, *), Bridge.discordUsesWrongMic() {
             showTip(title: "Du er i en Discord-samtale",
                     body: "Velg «BlackHole 2ch» som mikrofon i Discord (Innstillinger, Voice & Video), så kan Mute Bridge dempe deg mens du dikterer.")
@@ -599,15 +630,16 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if autoUpdate { installUpdateIfIdle() }
     }
 
-    @objc private func toggleEnabled(_ sender: NSSwitch) {
-        let d = UserDefaults.standard
-        if sender.state == .on {
-            d.set(d.string(forKey: "modeBeforeOff") ?? "auto", forKey: "mode")
-        } else {
-            if mode != "off" { d.set(mode, forKey: "modeBeforeOff") }
-            d.set("off", forKey: "mode")
+    @objc private func toggleEnabled(_ sender: BlueSwitch) {
+        UserDefaults.standard.set(sender.isOn, forKey: "muting")
+        unmutedDictations = 0; nagShown = false
+        if !muting {
+            if latched { unlatch(reopen: false) }
+            if !fnDown { routing?.mute(false) }
+            endMute()
+        } else if fnDown || latched {
+            routing?.mute(true)
         }
-        applyMode()
         updateMenu()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in self?.status.menu?.cancelTracking() }
     }
@@ -657,8 +689,8 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func updateIcon() {
-        let state = routing == nil ? "AV" : latched ? "LÅST" : fnDown ? "STILLE" : "LIVE"
-        let lv = state == "AV" ? 0 : Int((level * 8).rounded())
+        let state = !muting ? (routing == nil ? "AV" : "PASS") : routing == nil ? "VENT" : latched ? "LÅST" : fnDown ? "STILLE" : "LIVE"
+        let lv = (state == "AV" || state == "VENT") ? 0 : Int((level * 8).rounded())
         let variant = lv == 0 ? 0 : 1 + frameCount / 2 % 2
         let dim = state == "LÅST" && Int(Date().timeIntervalSinceReferenceDate * 2) % 2 == 0
         let key = "\(state)-\(lv)-\(variant)-\(dim)"
@@ -676,11 +708,11 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
         status.button?.toolTip = message
         let menu = NSMenu()
         let switchItem = NSMenuItem()
-        switchItem.view = SwitchView(title: "Mute Bridge", subtitle: message, on: mode != "off", target: self, action: #selector(toggleEnabled(_:)))
+        switchItem.view = SwitchView(title: "Demp meg når jeg dikterer", subtitle: muting ? (routing == nil ? "På · venter på Discord-samtale" : "På · Discord hører ikke dikteringen") : "Av · Discord hører deg også når du dikterer", on: muting, target: self, action: #selector(toggleEnabled(_:)))
         menu.addItem(switchItem)
         menu.addItem(.separator())
         let modeMenu = NSMenu()
-        let modes = [("auto", "Automatisk – bare i Discord-samtale"), ("always", "Alltid på"), ("off", "Av")]
+        let modes = [("auto", "Automatisk – bare i Discord-samtale"), ("always", "Alltid")]
         for (id, title) in modes {
             let item = NSMenuItem(title: title, action: #selector(pickMode(_:)), keyEquivalent: "")
             item.representedObject = id; item.target = self; item.state = mode == id ? .on : .off
@@ -887,14 +919,13 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
         releaseTimer?.cancel()
         let now = Date()
         if pressed {
-            routing?.mute(true)
-            beginMute()
+            if muting { routing?.mute(true); beginMute() } else { countUnmuted(now) }
             pressedAt = now
             if !latched { checkDiscordMic() }
             if latched {
                 unlatch(reopen: false)      // en ny fn-trykk avslutter diktering
                 justUnlatched = true
-            } else if let tap = lastQuickTap, now.timeIntervalSince(tap) < doubleTapWindow {
+            } else if muting, let tap = lastQuickTap, now.timeIntervalSince(tap) < doubleTapWindow {
                 latch()                      // dobbelttrykk: hold mutet
             }
             lastQuickTap = nil
@@ -911,6 +942,17 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
             scheduleOpen(after: delay)
         }
         DispatchQueue.main.async { self.updateMenu() }
+    }
+
+    /// Diktering uten at dempingen er på, mens noen faktisk lytter i en samtale: etter tre ganger kommer et lite pek.
+    private func countUnmuted(_ now: Date) {
+        guard routing != nil, !nagShown, now.timeIntervalSince(lastCounted) > 4 else { return }
+        if Bridge.smartAvailable && !othersReadBlackHole() { return }
+        lastCounted = now
+        unmutedDictations += 1
+        guard unmutedDictations >= 3 else { return }
+        nagShown = true
+        notify(title: "Pssst … Discord hører deg dikte 🙉", body: "Tredje gangen nå. For no mas, skru på Mute Bridge.")
     }
 
     private func scheduleOpen(after delay: Double) {
