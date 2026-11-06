@@ -103,6 +103,17 @@ func systemDefaultInput() -> AudioDeviceID? {
     return audioProperty(AudioObjectID(kAudioObjectSystemObject), kAudioHardwarePropertyDefaultInputDevice, into: &id) && id != 0 ? id : nil
 }
 
+/// Hvis BlackHole står som systemets standard mikrofon, får alle andre apper (DaVinci, QuickTime …) stillhet når Mute Bridge demper.
+/// Bytt standard tilbake til en ekte mikrofon. Returnerer navnet hvis den byttet.
+func moveDefaultInputOffBlackHole() -> String? {
+    guard let bh = blackHole(), systemDefaultInput() == bh, let target = chosenInput() else { return nil }
+    var id = target.id
+    var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultInputDevice, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+    let status = AudioObjectSetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, UInt32(MemoryLayout<AudioDeviceID>.size), &id)
+    dlog("standard mikrofon var BlackHole, byttet til \(target.name) (status \(status))")
+    return status == noErr ? target.name : nil
+}
+
 /// Valgt mikrofon: det brukeren har valgt i menyen, ellers systemets standard (aldri BlackHole), ellers den innebygde.
 func chosenInput() -> InputDevice? {
     let devices = inputDevices()
@@ -990,6 +1001,9 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func start() {
         stop()
         guard blackHole() != nil else { message = "BlackHole 2ch mangler"; updateMenu(); return }
+        if let name = moveDefaultInputOffBlackHole() {
+            notify(title: "Standard mikrofon byttet til \(name)", body: "BlackHole skal bare brukes i Discord. Nå får andre apper (som DaVinci) lyd også når du dempes.")
+        }
         guard CGPreflightListenEventAccess() else {
             _ = CGRequestListenEventAccess()
             message = "Aktiver Input Monitoring og start Bridge på nytt."
