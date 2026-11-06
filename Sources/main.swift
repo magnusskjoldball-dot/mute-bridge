@@ -191,6 +191,16 @@ func iconColors(_ state: String) -> (NSColor, NSColor) {
 
 /// Fem små kapsler. Tegnes bare én gang per kombinasjon og caches av kalleren.
 func meterImage(state: String, level: Int, variant: Int, dim: Bool) -> NSImage {
+    if state == "AV" {
+        // Hvile: bare en liten, diskret prikk som følger menylinjens farge (lys/mørk)
+        let dot = NSImage(size: NSSize(width: 14, height: 18), flipped: false) { _ in
+            NSColor.black.withAlphaComponent(0.55).setFill()
+            NSBezierPath(ovalIn: NSRect(x: 4, y: 6, width: 6, height: 6)).fill()
+            return true
+        }
+        dot.isTemplate = true
+        return dot
+    }
     let shapes: [[CGFloat]] = [[0.55, 0.85, 1.0, 0.7, 0.45], [0.7, 1.0, 0.6, 0.9, 0.5], [0.45, 0.7, 0.95, 1.0, 0.65]]
     let (c0, c1) = iconColors(state)
     let a = c0.usingColorSpace(.sRGB)!, b = c1.usingColorSpace(.sRGB)!
@@ -287,6 +297,27 @@ final class Spectrum {
     func reset() { bands = [CGFloat](repeating: 0, count: count) }
 }
 
+final class SwitchView: NSView {
+    let toggle = NSSwitch()
+    init(title: String, subtitle: String, on: Bool, target: AnyObject, action: Selector) {
+        super.init(frame: NSRect(x: 0, y: 0, width: 290, height: 48))
+        let t = NSTextField(labelWithString: title)
+        t.font = .systemFont(ofSize: 13, weight: .semibold)
+        t.frame = NSRect(x: 16, y: 26, width: 200, height: 17)
+        let sub = NSTextField(labelWithString: subtitle)
+        sub.font = .systemFont(ofSize: 11)
+        sub.textColor = .secondaryLabelColor
+        sub.lineBreakMode = .byTruncatingTail
+        sub.frame = NSRect(x: 16, y: 8, width: 210, height: 15)
+        toggle.state = on ? .on : .off
+        toggle.target = target
+        toggle.action = action
+        toggle.frame = NSRect(x: 236, y: 12, width: 40, height: 24)
+        addSubview(t); addSubview(sub); addSubview(toggle)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+}
+
 final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var menuOpen = false
     private var frame = 0
@@ -314,6 +345,9 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var headerView: HeaderView?
     private var muteBegan: Date?
     private var updateAvailable: (version: String, url: String)?
+    private var updateAsset: String?
+    private var updating = false
+    private var autoUpdate: Bool { UserDefaults.standard.object(forKey: "autoUpdate") as? Bool ?? true }
     private let updateRepo = "magnusskjoldball-dot/mute-bridge"
     private let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0"
     private var today: (count: Int, seconds: Double) {
@@ -342,10 +376,15 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
         status = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         updateMenu()
         start()
-        let ev = Timer(timeInterval: 3, repeats: true) { [weak self] _ in self?.evaluate() }
+        let ev = Timer(timeInterval: 3, repeats: true) { [weak self] _ in self?.evaluate(); self?.installUpdateIfIdle() }
         ev.tolerance = 1
         RunLoop.main.add(ev, forMode: .common)
         evalTimer = ev
+        let defaults = UserDefaults.standard
+        if let last = defaults.string(forKey: "lastVersion"), last != version {
+            notify(title: "Mute Bridge er oppdatert", body: "Du har nå versjon \(version).")
+        }
+        defaults.set(version, forKey: "lastVersion")
         watchDevices()
         checkForUpdates()
         let upd = Timer(timeInterval: 6 * 3600, repeats: true) { [weak self] _ in self?.checkForUpdates() }
@@ -512,20 +551,102 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
             guard let data, let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let tag = json["tag_name"] as? String, let page = json["html_url"] as? String else { return }
             let latest = tag.trimmingCharacters(in: CharacterSet(charactersIn: "vV"))
+            let assets = json["assets"] as? [[String: Any]] ?? []
+            let zip = assets.first { ($0["name"] as? String) == "Mute-Bridge.zip" }?["browser_download_url"] as? String
             DispatchQueue.main.async {
-                let newer = latest.compare(self.version, options: .numeric) == .orderedDescending
-                if newer, self.updateAvailable?.version != latest {
-                    self.updateAvailable = (latest, page)
-                    self.updateMenu()
-                    let c = UNUserNotificationCenter.current()
-                    c.requestAuthorization(options: [.alert]) { ok, _ in
-                        guard ok else { return }
-                        let n = UNMutableNotificationContent()
-                        n.title = "Mute Bridge \(latest) er klar"
-                        n.body = "Klikk på ikonet i menylinjen for å laste ned."
-                        c.add(UNNotificationRequest(identifier: "update", content: n, trigger: nil))
-                    }
-                }
+                guard latest.compare(self.version, options: .numeric) == .orderedDescending else { return }
+                let isNew = self.updateAvailable?.version != latest
+                self.updateAvailable = (latest, page)
+                self.updateAsset = zip
+                self.updateMenu()
+                if self.autoUpdate, zip != nil { self.installUpdateIfIdle() }
+                else if isNew { self.notify(title: "Mute Bridge \(latest) er klar", body: "Klikk på ikonet i menylinjen og velg «Oppdater».") }
+            }
+        }.resume()
+    }
+
+    private func notify(title: String, body: String) {
+        let c = UNUserNotificationCenter.current()
+        c.requestAuthorization(options: [.alert]) { ok, _ in
+            guard ok else { return }
+            let n = UNMutableNotificationContent()
+            n.title = title; n.body = body
+            c.add(UNNotificationRequest(identifier: UUID().uuidString, content: n, trigger: nil))
+        }
+    }
+
+    @discardableResult
+    private static func run(_ path: String, _ args: [String]) -> Int32 {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: path)
+        p.arguments = args
+        p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
+        do { try p.run(); p.waitUntilExit(); return p.terminationStatus } catch { return -1 }
+    }
+
+    @objc private func updateNow() {
+        if updateAsset != nil { installUpdateIfIdle(force: true) } else { openUpdate() }
+    }
+
+    @objc private func toggleAutoUpdate() {
+        UserDefaults.standard.set(!autoUpdate, forKey: "autoUpdate")
+        updateMenu()
+        if autoUpdate { installUpdateIfIdle() }
+    }
+
+    @objc private func toggleEnabled(_ sender: NSSwitch) {
+        let d = UserDefaults.standard
+        if sender.state == .on {
+            d.set(d.string(forKey: "modeBeforeOff") ?? "auto", forKey: "mode")
+        } else {
+            if mode != "off" { d.set(mode, forKey: "modeBeforeOff") }
+            d.set("off", forKey: "mode")
+        }
+        applyMode()
+        updateMenu()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in self?.status.menu?.cancelTracking() }
+    }
+
+    /// Laster ned, verifiserer og bytter ut appen, men aldri midt i en samtale eller diktering.
+    private func installUpdateIfIdle(force: Bool = false) {
+        guard !updating, let asset = updateAsset, let u = updateAvailable, force || autoUpdate,
+              let url = URL(string: asset) else { return }
+        if !force, fnDown || latched || (Bridge.smartAvailable && othersReadBlackHole()) { return }
+        let dest = Bundle.main.bundleURL.path
+        guard FileManager.default.isWritableFile(atPath: Bundle.main.bundleURL.deletingLastPathComponent().path) else {
+            updateAsset = nil
+            notify(title: "Mute Bridge \(u.version) er klar", body: "Kunne ikke oppdatere automatisk. Kjør installasjonslinjen på nytt (se GitHub).")
+            return
+        }
+        updating = true
+        message = "Oppdaterer til \(u.version) …"
+        updateMenu()
+        URLSession.shared.downloadTask(with: url) { [weak self] tmp, _, err in
+            guard let self else { return }
+            var ok = false
+            defer {
+                if !ok { DispatchQueue.main.async { self.updating = false; self.updateAsset = nil; self.message = "Oppdatering feilet – prøver ikke igjen nå"; self.updateMenu() } }
+            }
+            guard let tmp, err == nil else { return }
+            let fm = FileManager.default
+            let work = fm.temporaryDirectory.appendingPathComponent("mutebridge-\(UUID().uuidString)")
+            try? fm.createDirectory(at: work, withIntermediateDirectories: true)
+            let zip = work.appendingPathComponent("update.zip")
+            guard (try? fm.moveItem(at: tmp, to: zip)) != nil,
+                  Bridge.run("/usr/bin/ditto", ["-x", "-k", zip.path, work.path]) == 0,
+                  let appURL = (try? fm.contentsOfDirectory(at: work, includingPropertiesForKeys: nil))?.first(where: { $0.pathExtension == "app" }),
+                  let bundle = Bundle(url: appURL), bundle.bundleIdentifier == Bundle.main.bundleIdentifier,
+                  let v = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String,
+                  v.compare(self.version, options: .numeric) == .orderedDescending,
+                  Bridge.run("/usr/bin/codesign", ["-v", "--strict", appURL.path]) == 0 else { return }
+            ok = true
+            let script = "while kill -0 \(getpid()) 2>/dev/null; do sleep 0.3; done; /usr/bin/ditto '\(appURL.path)' '\(dest).new' && rm -rf '\(dest)' && mv '\(dest).new' '\(dest)'; /usr/bin/xattr -dr com.apple.quarantine '\(dest)'; /usr/bin/open '\(dest)'"
+            DispatchQueue.main.async {
+                let p = Process()
+                p.executableURL = URL(fileURLWithPath: "/bin/sh")
+                p.arguments = ["-c", "nohup /bin/sh -c \"$0\" >/dev/null 2>&1 &", script]
+                try? p.run()
+                self.quit()
             }
         }.resume()
     }
@@ -549,7 +670,9 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateIcon()
         status.button?.toolTip = message
         let menu = NSMenu()
-        menu.addItem(withTitle: message, action: nil, keyEquivalent: "")
+        let switchItem = NSMenuItem()
+        switchItem.view = SwitchView(title: "Mute Bridge", subtitle: message, on: mode != "off", target: self, action: #selector(toggleEnabled(_:)))
+        menu.addItem(switchItem)
         menu.addItem(.separator())
         let modeMenu = NSMenu()
         let modes = [("auto", "Automatisk – bare i Discord-samtale"), ("always", "Alltid på"), ("off", "Av")]
@@ -578,7 +701,8 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(micItem)
         menu.addItem(.separator())
         var items: [(String, Selector)] = []
-        if let u = updateAvailable { items.append(("⬆︎  Ny versjon \(u.version) – last ned", #selector(openUpdate))) }
+        if updating { items.append(("⬆︎  Oppdaterer …", #selector(checkNow))) }
+        else if let u = updateAvailable { items.append(("⬆︎  Oppdater til \(u.version) nå", #selector(updateNow))) }
         if latched { items.append(("🔓  Lås opp mikrofon", #selector(unlatchFromMenu))) }
         items.append(("↻  Start på nytt", #selector(start)))
         if !updateRepo.isEmpty { items.append(("Sjekk etter oppdateringer", #selector(checkNow))) }
@@ -587,6 +711,8 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let item = menu.addItem(withTitle: title, action: action, keyEquivalent: "")
             item.target = self
         }
+        let au = menu.addItem(withTitle: "Oppdater automatisk", action: #selector(toggleAutoUpdate), keyEquivalent: "")
+        au.target = self; au.state = autoUpdate ? .on : .off
         let ver = menu.addItem(withTitle: "Mute Bridge v\(version)", action: nil, keyEquivalent: "")
         ver.isEnabled = false
         status.menu = menu

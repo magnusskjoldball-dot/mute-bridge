@@ -22,6 +22,8 @@ Deretter, bare første gang:
 - **Hold fn**: mutet så lenge du holder.
 - **Dobbelttrykk fn**: mutet til du trykker fn igjen (eller Esc).
 
+Bryteren øverst i menyen slår Mute Bridge av og på.
+
 **Drift:** Som standard er Bridge *automatisk*: den bruker mikrofonen bare mens du er i en Discord-samtale (og er ellers av). Endre under *Drift* i menyen.
 
 Menylinjen viser søyler som følger stemmen din: lilla/blå = sendes, rød = mutet, oransje = låst, grå = av.
@@ -29,7 +31,7 @@ Mikrofonen er den Macen bruker som standard. Bytt under *Mikrofon* i menyen.
 
 ## Oppdatering
 
-Appen varsler når det finnes en ny versjon. Kjør installasjonslinjen på nytt for å oppdatere.
+Appen oppdaterer seg selv (aldri midt i en samtale). Du får et lite varsel når det er gjort. Slå av under *Oppdater automatisk* i menyen hvis du vil.
 
 <details>
 <summary>Installere for hånd</summary>
