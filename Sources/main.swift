@@ -19,6 +19,15 @@ enum RoutingError: LocalizedError {
     }
 }
 
+func dlog(_ text: String) {
+    let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/MuteBridge.log")
+    let f = DateFormatter(); f.dateFormat = "MM-dd HH:mm:ss.SSS"
+    let line = "\(f.string(from: Date())) \(text)\n"
+    if let size = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? Int, size > 300_000 { try? FileManager.default.removeItem(at: url) }
+    if let h = try? FileHandle(forWritingTo: url) { h.seekToEndOfFile(); h.write(line.data(using: .utf8)!); try? h.close() }
+    else { try? line.write(to: url, atomically: true, encoding: .utf8) }
+}
+
 func audioProperty<T>(_ id: AudioObjectID, _ selector: AudioObjectPropertySelector, into value: inout T) -> Bool {
     var address = AudioObjectPropertyAddress(mSelector: selector, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
     var size = UInt32(MemoryLayout<T>.size)
@@ -190,7 +199,27 @@ func iconColors(_ state: String) -> (NSColor, NSColor) {
 }
 
 /// Fem små kapsler. Tegnes bare én gang per kombinasjon og caches av kalleren.
-func meterImage(state: String, level: Int, variant: Int, dim: Bool) -> NSImage {
+/// Legger en liten rød prikk øverst til høyre når en oppdatering venter.
+func meterImage(state: String, level: Int, variant: Int, dim: Bool, badge: Bool) -> NSImage {
+    let base = baseMeterImage(state: state, level: level, variant: variant, dim: dim)
+    guard badge else { return base }
+    let size = NSSize(width: base.size.width + 5, height: base.size.height)
+    let image = NSImage(size: size, flipped: false) { _ in
+        if state == "AV" {
+            NSColor.labelColor.withAlphaComponent(0.6).setStroke()
+            let p = NSBezierPath(ovalIn: NSRect(x: 3.5, y: 5.5, width: 7, height: 7)); p.lineWidth = 1.3; p.stroke()
+        } else {
+            base.draw(at: .zero, from: .zero, operation: .sourceOver, fraction: 1)
+        }
+        NSColor(srgbRed: 1, green: 0.27, blue: 0.23, alpha: 1).setFill()
+        NSBezierPath(ovalIn: NSRect(x: size.width - 7, y: size.height - 8, width: 6, height: 6)).fill()
+        return true
+    }
+    image.isTemplate = false
+    return image
+}
+
+func baseMeterImage(state: String, level: Int, variant: Int, dim: Bool) -> NSImage {
     if state == "AV" {
         // Dempingen er av: tom ring som følger menylinjens farge
         let ring = NSImage(size: NSSize(width: 14, height: 18), flipped: false) { _ in
@@ -306,20 +335,61 @@ final class Spectrum {
 }
 
 final class BlueSwitch: NSControl {
-    var isOn = false { didSet { needsDisplay = true } }
-    override var isFlipped: Bool { false }
-    override func draw(_ dirtyRect: NSRect) {
-        let r = bounds.insetBy(dx: 1, dy: 1)
-        let track = NSBezierPath(roundedRect: r, xRadius: r.height / 2, yRadius: r.height / 2)
-        (isOn ? NSColor(srgbRed: 0.22, green: 0.51, blue: 0.97, alpha: 1) : NSColor(white: 0.5, alpha: 0.45)).setFill()
-        track.fill()
-        let d = r.height - 4
-        let x = isOn ? r.maxX - d - 2 : r.minX + 2
-        NSColor.white.setFill()
-        NSBezierPath(ovalIn: NSRect(x: x, y: r.minY + 2, width: d, height: d)).fill()
+    private let track = CALayer(), knob = CALayer()
+    private let onColor = NSColor(srgbRed: 0.22, green: 0.51, blue: 0.97, alpha: 1).cgColor
+    private let offColor = NSColor(white: 0.5, alpha: 0.45).cgColor
+    private var d: CGFloat { bounds.height - 4 }
+    private var stretch: CGFloat { d * 1.32 }
+    private(set) var isOn = false
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.addSublayer(track); layer?.addSublayer(knob)
+        knob.backgroundColor = NSColor.white.cgColor
+        knob.shadowColor = NSColor.black.cgColor; knob.shadowOpacity = 0.35; knob.shadowRadius = 2; knob.shadowOffset = CGSize(width: 0, height: -1)
     }
+    required init?(coder: NSCoder) { fatalError() }
+    override func layout() {
+        super.layout()
+        track.frame = bounds; track.cornerRadius = bounds.height / 2
+        place(on: isOn, width: d)
+        track.backgroundColor = isOn ? onColor : offColor
+    }
+    private func place(on: Bool, width w: CGFloat) {
+        knob.cornerRadius = d / 2
+        let x = on ? bounds.width - 2 - w : 2
+        knob.frame = NSRect(x: x, y: 2, width: w, height: d)
+    }
+    func set(on: Bool) { isOn = on; needsLayout = true }
     override func mouseDown(with event: NSEvent) {
+        // trykk: knappen strekkes litt, som en dråpe
+        CATransaction.begin(); CATransaction.setAnimationDuration(0.12)
+        place(on: isOn, width: stretch)
+        CATransaction.commit()
+    }
+    override func mouseUp(with event: NSEvent) {
         isOn.toggle()
+        let target = bounds.width - 2 - d
+        let fromX = knob.presentation()?.frame.minX ?? knob.frame.minX
+        let toX = isOn ? target : 2
+        // posisjon: myk fjær med lett overshoot
+        knob.frame = NSRect(x: toX, y: 2, width: d, height: d)
+        let spring = CASpringAnimation(keyPath: "position.x")
+        spring.fromValue = fromX + stretch / 2; spring.toValue = toX + d / 2
+        spring.mass = 1; spring.stiffness = 230; spring.damping = 15; spring.initialVelocity = 0
+        spring.duration = spring.settlingDuration
+        knob.add(spring, forKey: "x")
+        // «væske»: bredden strekkes midt i glidningen og trekker seg sammen igjen
+        let w = CAKeyframeAnimation(keyPath: "bounds.size.width")
+        w.values = [stretch, stretch * 1.12, d * 1.1, d]; w.keyTimes = [0, 0.3, 0.7, 1]; w.duration = 0.38
+        w.timingFunctions = [CAMediaTimingFunction(name: .easeOut), CAMediaTimingFunction(name: .easeInEaseOut), CAMediaTimingFunction(name: .easeOut)]
+        knob.add(w, forKey: "w")
+        let c = CABasicAnimation(keyPath: "backgroundColor")
+        c.fromValue = track.presentation()?.backgroundColor ?? track.backgroundColor
+        c.toValue = isOn ? onColor : offColor; c.duration = 0.28
+        c.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        track.backgroundColor = isOn ? onColor : offColor
+        track.add(c, forKey: "c")
         if let a = action { NSApp.sendAction(a, to: target, from: self) }
     }
 }
@@ -336,7 +406,7 @@ final class SwitchView: NSView {
         sub.textColor = .secondaryLabelColor
         sub.lineBreakMode = .byTruncatingTail
         sub.frame = NSRect(x: 16, y: 9, width: 255, height: 15)
-        toggle.isOn = on
+        toggle.set(on: on)
         toggle.target = target
         toggle.action = action
         toggle.frame = NSRect(x: 280, y: 14, width: 46, height: 26)
@@ -374,6 +444,7 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var updateAvailable: (version: String, url: String)?
     private var updateAsset: String?
     private var updating = false
+    private var updateWanted = false
     private var autoUpdate: Bool { UserDefaults.standard.object(forKey: "autoUpdate") as? Bool ?? true }
     private let updateRepo = "magnusskjoldball-dot/mute-bridge"
     private let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0"
@@ -443,6 +514,7 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let route = Routing()
             try route.start()
             routing = route
+            dlog("rute startet (mikrofon: \(chosenInput()?.name ?? "?"))")
             fnDown = CGEventSource.flagsState(.hidSystemState).contains(.maskSecondaryFn)
             route.mute(muting && (fnDown || latched))
             message = "Sender mikrofonen til BlackHole 2ch"
@@ -456,6 +528,7 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func endRoute() {
+        dlog("rute stoppet")
         routing?.mute(true)
         routing = nil
         stopMeter()
@@ -558,6 +631,7 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private var restartWork: DispatchWorkItem?
     private func scheduleRestart() {
+        dlog("lydenheter endret – starter på nytt om 0,8 s")
         restartWork?.cancel()
         let w = DispatchWorkItem { [weak self] in self?.start() }
         restartWork = w
@@ -641,14 +715,23 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
             routing?.mute(true)
         }
         updateMenu()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in self?.status.menu?.cancelTracking() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) { [weak self] in self?.status.menu?.cancelTracking() }
     }
 
     /// Laster ned, verifiserer og bytter ut appen, men aldri midt i en samtale eller diktering.
     private func installUpdateIfIdle(force: Bool = false) {
-        guard !updating, let asset = updateAsset, let u = updateAvailable, force || autoUpdate,
+        guard !updating, let asset = updateAsset, let u = updateAvailable, force || autoUpdate || updateWanted,
               let url = URL(string: asset) else { return }
-        if !force, fnDown || latched || (Bridge.smartAvailable && othersReadBlackHole()) { return }
+        if fnDown || latched || (Bridge.smartAvailable && othersReadBlackHole()) {
+            if force {
+                // Aldri bytt ut appen midt i en samtale: si fra, og oppdater så snart samtalen er over
+                updateWanted = true
+                notify(title: "Mute Bridge \(u.version) er klar", body: "Gå ut av Discord-samtalen, så oppdaterer den seg selv med en gang.")
+                updateMenu()
+            }
+            return
+        }
+        updateWanted = false
         let dest = Bundle.main.bundleURL.path
         guard FileManager.default.isWritableFile(atPath: Bundle.main.bundleURL.deletingLastPathComponent().path) else {
             updateAsset = nil
@@ -693,10 +776,11 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let lv = (state == "AV" || state == "VENT") ? 0 : Int((level * 8).rounded())
         let variant = lv == 0 ? 0 : 1 + frameCount / 2 % 2
         let dim = state == "LÅST" && Int(Date().timeIntervalSinceReferenceDate * 2) % 2 == 0
-        let key = "\(state)-\(lv)-\(variant)-\(dim)"
+        let badge = updateAvailable != nil
+        let key = "\(state)-\(lv)-\(variant)-\(dim)-\(badge)"
         guard key != lastIconKey else { return }
         lastIconKey = key
-        if iconCache[key] == nil { iconCache[key] = meterImage(state: state, level: lv, variant: variant, dim: dim) }
+        if iconCache[key] == nil { iconCache[key] = meterImage(state: state, level: lv, variant: variant, dim: dim, badge: badge) }
         status.button?.image = iconCache[key]
         status.button?.imagePosition = .imageOnly
     }
@@ -739,7 +823,10 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
         var items: [(String, Selector)] = []
         if updating { items.append(("⬆︎  Oppdaterer …", #selector(checkNow))) }
-        else if let u = updateAvailable { items.append(("⬆︎  Oppdater til \(u.version) nå", #selector(updateNow))) }
+        else if let u = updateAvailable {
+            let inCall = fnDown || latched || (Bridge.smartAvailable && othersReadBlackHole())
+            items.append((updateWanted && inCall ? "⬆︎  \(u.version) klar – gå ut av samtalen for å oppdatere" : "⬆︎  Oppdater til \(u.version) nå", #selector(updateNow)))
+        }
         if latched { items.append(("🔓  Lås opp mikrofon", #selector(unlatchFromMenu))) }
         items.append(("↻  Start på nytt", #selector(start)))
         if !updateRepo.isEmpty { items.append(("Sjekk etter oppdateringer", #selector(checkNow))) }
@@ -794,11 +881,11 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let callback: CGEventTapCallBack = { _, type, event, context in
             let bridge = Unmanaged<Bridge>.fromOpaque(context!).takeUnretainedValue()
             if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-                bridge.routing?.mute(true)
+                // macOS slo av lytteren (for treg/system under press): slå den på igjen i stedet for å stoppe alt
+                dlog("fn-lytter slått av av macOS (\(type.rawValue)) – slår på igjen")
                 DispatchQueue.main.async {
-                    bridge.stop()
-                    bridge.message = "Fn-overvåking stoppet. Start Bridge på nytt."
-                    bridge.updateMenu()
+                    if let tap = bridge.eventTap { CGEvent.tapEnable(tap: tap, enable: true) }
+                    bridge.resync()
                 }
             } else if type == .flagsChanged {
                 bridge.setFn(event.flags.contains(.maskSecondaryFn))
@@ -913,7 +1000,14 @@ final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return inCall
     }
 
+    func resync() {
+        let down = CGEventSource.flagsState(.hidSystemState).contains(.maskSecondaryFn)
+        dlog("resync fn=\(down)")
+        if down != fnDown { setFn(down) }
+    }
+
     private func setFn(_ pressed: Bool) {
+        dlog("fn \(pressed ? "ned" : "opp") (kjent: \(fnDown), rute: \(routing != nil), demping: \(muting))")
         guard pressed != fnDown else { return }
         fnDown = pressed
         releaseTimer?.cancel()
